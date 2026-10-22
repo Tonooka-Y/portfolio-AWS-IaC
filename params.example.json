@@ -1,0 +1,14 @@
+{
+  "portfolio-hosting": {
+    "DomainName": "example.com",
+    "HostedZoneId": "Z0000000000000000000"
+  },
+  "portfolio-form": {
+    "DomainName": "example.com",
+    "HostedZoneId": "Z0000000000000000000",
+    "RecipientEmail": "you@example.com",
+    "SenderLocalPart": "noreply",
+    "ThanksPath": "/html/contact-thanks.html",
+    "ErrorPath": "/html/contact-error.html"
+  }
+}

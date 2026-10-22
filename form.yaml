@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  portfolio-form - Contact form backend for the portfolio site
+  (API Gateway HTTP API / Lambda / Amazon SES).
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: "サイトのドメイン（www なし。例：example.com）。送信元アドレス・Origin の確認・リダイレクト先に使う"
+    AllowedPattern: "^(?!www\\.)([a-z0-9-]+\\.)+[a-z]{2,}$"
+    ConstraintDescription: "www を付けない小文字のドメイン名を指定する"
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: "DomainName のパブリックホストゾーン ID（SES の DKIM レコードの作成に使う）"
+
+  RecipientEmail:
+    Type: String
+    Description: "問い合わせの受け取り先のメールアドレス"
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: "メールアドレスの形式で指定する"
+
+  SenderLocalPart:
+    Type: String
+    Default: noreply
+    Description: "送信元アドレスの @ より前（送信元は <SenderLocalPart>@<DomainName> になる）"
+    AllowedPattern: "^[a-z0-9._-]+$"
+
+  ThanksPath:
+    Type: String
+    Default: /html/contact-thanks.html
+    Description: "送信完了ページのパス（ドメインより後ろ）"
+    AllowedPattern: "^/[A-Za-z0-9._/-]*$"
+
+  ErrorPath:
+    Type: String
+    Default: /html/contact-error.html
+    Description: "エラーページのパス（ドメインより後ろ）"
+    AllowedPattern: "^/[A-Za-z0-9._/-]*$"
+
+Rules:
+  RegionMustBeUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-east-1]
+        AssertDescription: "portfolio-hosting と同じ us-east-1 に作成する"
+
+Resources:
+  # ============================================================
+  # 01. SES
+  #     送信元は自分のドメインのアドレス
+  #     DKIM の CNAME レコードを作ることで、ドメインの検証まで自動で完了する
+  # ============================================================
+  DomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+
+  DkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt DomainIdentity.DkimDNSTokenValue1
+
+  DkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt DomainIdentity.DkimDNSTokenValue2
+
+  DkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords:
+        - !GetAtt DomainIdentity.DkimDNSTokenValue3
+
+  # 作成後に届く確認メールのリンクを押す
+  RecipientIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref RecipientEmail
+
+  # ============================================================
+  # 02. Lambda
+  # ============================================================
+  ContactLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: portfolio
+
+  ContactFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: contact-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ContactLogGroup.Arn
+              - Sid: SendFromOwnDomainOnly
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+                  - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${RecipientEmail}"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Sub "${SenderLocalPart}@${DomainName}"
+      Tags:
+        - Key: Project
+          Value: portfolio
+
+  ContactFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Contact form handler (Origin check, honeypot, validation, send via SES)"
+      Runtime: python3.14
+      Architectures:
+        - arm64
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt ContactFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ContactLogGroup
+      Environment:
+        Variables:
+          SENDER: !Sub "${SenderLocalPart}@${DomainName}"
+          RECIPIENT: !Ref RecipientEmail
+          ALLOWED_ORIGIN: !Sub "https://${DomainName}"
+          THANKS_URL: !Sub "https://${DomainName}${ThanksPath}"
+          ERROR_URL: !Sub "https://${DomainName}${ErrorPath}"
+      Code:
+        ZipFile: |
+          import base64
+          import logging
+          import os
+          import re
+          from urllib.parse import parse_qs
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ses = boto3.client("sesv2")
+
+          SENDER = os.environ["SENDER"]
+          RECIPIENT = os.environ["RECIPIENT"]
+          ALLOWED_ORIGIN = os.environ["ALLOWED_ORIGIN"]
+          THANKS_URL = os.environ["THANKS_URL"]
+          ERROR_URL = os.environ["ERROR_URL"]
+
+          # contact.html の <select name="topic"> の選択肢と一致させる
+          TOPICS = {
+              "selection": "選考・面談・会社説明会などのご案内",
+              "projects": "掲載プロジェクトについてのご質問",
+              "profile": "プロフィール・スキルについてのご質問",
+              "other": "その他",
+          }
+
+          EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+          # 1行で扱う項目から改行・制御文字を取り除く（ヘッダーインジェクション対策）
+          CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+          MAX_FIELDS = 20
+
+
+          def redirect(url):
+              return {
+                  "statusCode": 302,
+                  "headers": {"Location": url, "Cache-Control": "no-store"},
+                  "body": "",
+              }
+
+
+          def single_line(value):
+              return CONTROL_RE.sub(" ", value).strip()
+
+
+          def parse_form(event):
+              body = event.get("body") or ""
+              if event.get("isBase64Encoded"):
+                  body = base64.b64decode(body).decode("utf-8")
+              params = parse_qs(body, keep_blank_values=True, max_num_fields=MAX_FIELDS)
+              return {key: values[0] for key, values in params.items()}
+
+
+          # contact.html の HTML 側の検証（required / maxlength / type="email"）と同じ条件
+          def validate(form):
+              company = single_line(form.get("company", ""))
+              name = single_line(form.get("name", ""))
+              email = single_line(form.get("email", ""))
+              topic = form.get("topic", "")
+              message = form.get("message", "").replace("\r\n", "\n").strip()
+              consent = form.get("consent", "")
+
+              if len(company) > 100:
+                  return None
+              if not name or len(name) > 50:
+                  return None
+              if not email or len(email) > 254 or not EMAIL_RE.match(email):
+                  return None
+              if topic not in TOPICS:
+                  return None
+              if not message or len(message) > 2000:
+                  return None
+              if consent != "agree":
+                  return None
+
+              return {
+                  "company": company,
+                  "name": name,
+                  "email": email,
+                  "topic": topic,
+                  "message": message,
+              }
+
+
+          def send(data):
+              subject = "[ポートフォリオ] " + TOPICS[data["topic"]] + " - " + data["name"]
+              body = "\n".join([
+                  "ポートフォリオサイトのお問い合わせフォームから送信されました。",
+                  "",
+                  "貴社名: " + (data["company"] or "（未記入）"),
+                  "お名前: " + data["name"],
+                  "メールアドレス: " + data["email"],
+                  "ご用件: " + TOPICS[data["topic"]],
+                  "",
+                  "内容:",
+                  data["message"],
+              ])
+              ses.send_email(
+                  FromEmailAddress=SENDER,
+                  Destination={"ToAddresses": [RECIPIENT]},
+                  ReplyToAddresses=[data["email"]],
+                  Content={
+                      "Simple": {
+                          "Subject": {"Data": subject, "Charset": "UTF-8"},
+                          "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+                      }
+                  },
+              )
+
+
+          def handler(event, context):
+              # 例外はすべてここで受け止め、API Gateway の生のエラーを出さない
+              # ログには結果の種類のみを出力し、問い合わせの内容・個人情報は出力しない
+              try:
+                  headers = event.get("headers") or {}
+                  if headers.get("origin") != ALLOWED_ORIGIN:
+                      logger.info("rejected: origin")
+                      return redirect(ERROR_URL)
+
+                  form = parse_form(event)
+
+                  if form.get("website"):
+                      logger.info("rejected: honeypot")
+                      return redirect(THANKS_URL)
+
+                  data = validate(form)
+                  if data is None:
+                      logger.info("rejected: validation")
+                      return redirect(ERROR_URL)
+
+                  send(data)
+                  logger.info("sent")
+                  return redirect(THANKS_URL)
+              except Exception as e:
+                  logger.error("error: %s", type(e).__name__)
+                  return redirect(ERROR_URL)
+      Tags:
+        - Key: Project
+          Value: portfolio
+
+  # ============================================================
+  # 03. API Gateway（HTTP API）
+  #     ルートは POST /contact のみ。CORS は設定しない（素のフォーム送信のため）
+  # ============================================================
+  ContactApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: "Contact form endpoint"
+      ProtocolType: HTTP
+      Tags:
+        Project: portfolio
+
+  ContactIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ContactApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ContactFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ContactRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ContactApi
+      RouteKey: POST /contact
+      Target: !Sub "integrations/${ContactIntegration}"
+
+  # スロットリング：API 全体に一律でかかる
+  ContactStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ContactApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 1
+        ThrottlingBurstLimit: 5
+      Tags:
+        Project: portfolio
+
+  ContactFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContactFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ContactApi}/*/POST/contact"
+
+Outputs:
+  ApiEndpoint:
+    Description: "contact.html の <form> の action に設定する URL"
+    Value: !Sub "${ContactApi.ApiEndpoint}/contact"
+
+  SenderAddress:
+    Description: "送信元アドレス"
+    Value: !Sub "${SenderLocalPart}@${DomainName}"
